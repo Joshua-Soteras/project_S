@@ -73,3 +73,12 @@ bun run preview
 ```
 
 Check out the [deployment documentation](https://nuxt.com/docs/getting-started/deployment) for more information.
+
+
+#backend 
+
+```bash 
+#creating template asp.net core
+dotnet new webapi 
+
+```

@@ -22,3 +22,46 @@ logs
 .env
 .env.*
 !.env.example
+
+# .NET
+bin/
+obj/
+*.user
+*.userosscache
+*.suo
+*.cache
+*.dll
+*.pdb
+*.exe
+!*.exe.config
+
+# NuGet
+*.nupkg
+.nuget/
+packages/
+
+# Visual Studio
+.vs/
+*.vsidx
+*.sln.docstates
+
+# Rider
+*.sln.iml
+
+# User-specific files
+*.rsuser
+launchSettings.json.user
+
+# Build results
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Ww][Ii][Nn]32/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/

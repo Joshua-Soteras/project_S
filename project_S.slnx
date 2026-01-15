@@ -1,0 +1,13 @@
+dotnet add backend/src/03-Web/ProjectS.Web.csproj reference backend/src/01-Core/ProjectS.Core.csproj<Solution>
+  <Folder Name="/backend/" />
+  <Folder Name="/backend/src/" />
+  <Folder Name="/backend/src/01-Core/">
+    <Project Path="backend/src/01-Core/ProjectS.Core.csproj" />
+  </Folder>
+  <Folder Name="/backend/src/02-Infrastructure/">
+    <Project Path="backend/src/02-Infrastructure/ProjectS.Infrastructure.csproj" />
+  </Folder>
+  <Folder Name="/backend/src/03-Web/">
+    <Project Path="backend/src/03-Web/ProjectS.Web.csproj" />
+  </Folder>
+</Solution>

@@ -98,10 +98,10 @@ flowchart TD
 
 ---
 
-## 5. Full Request — CSV Upload (End to End)
+## 5. Full Request — CSV Upload (End to End, Step 6+)
 
-The most complex flow in the system. Traces a user action from browser click
-to database row.
+`POST /api/surveys` returns `202 Accepted` immediately after saving CSV rows.
+NLP runs in a background worker. Angular polls the dashboard until complete.
 
 ```mermaid
 sequenceDiagram
@@ -110,6 +110,9 @@ sequenceDiagram
     participant API  as ASP.NET Core\nPOST /api/surveys
     participant CSV  as CsvParserService
     participant DB   as PostgreSQL
+    participant Q    as SurveyQueue\nChannel&lt;int&gt;
+    participant W    as SurveyProcessingWorker
+    participant SPS  as SurveyProcessingService
     participant SC   as SentimentClient
     participant NLP  as Python FastAPI\nPOST /analyze
 
@@ -122,7 +125,7 @@ sequenceDiagram
     API->>CSV: ParseAsync(IFormFile)
     CSV-->>API: ParsedSurvey { columns[], rows[] }
 
-    API->>DB: INSERT Survey (status=processing)
+    API->>DB: INSERT Survey (status="queued")
     DB-->>API: survey.Id
 
     API->>DB: INSERT SurveyColumn[] (one per CSV header)
@@ -132,26 +135,36 @@ sequenceDiagram
         API->>DB: INSERT SurveyResponse + ResponseValue[]\n(EF Core nav properties resolve FKs)
     end
 
-    API->>DB: SELECT ResponseValues\nWHERE ColumnId IN text-column Ids
-    DB-->>API: textValues[]
+    API->>Q: queue.Enqueue(survey.Id)
+    API-->>NG: 202 Accepted { id, name, status="queued", totalRows, columnCount }
+    NG->>NG: router.navigate(['/surveys', result.id])
+    NG->>User: Dashboard rendered — spinner shown
+
+    Note over W,SPS: Background (decoupled from HTTP request)
+    W->>Q: ReadAllAsync() dequeues survey.Id
+    W->>SPS: ProcessAsync(surveyId)
+    SPS->>DB: UPDATE Survey status="processing"
 
     loop Per text cell (batches of 100)
-        API->>SC: AnalyzeAsync(rawValue)
+        SPS->>SC: AnalyzeAsync(rawValue)
         SC->>NLP: POST /analyze { text }
         NLP-->>SC: { label, positive, neutral, negative }
-        SC-->>API: SentimentResponse
-        API->>DB: INSERT SentimentResult
+        SC-->>SPS: SentimentResponse
+        SPS->>DB: INSERT SentimentResult batch
     end
 
     loop Per text column
-        API->>DB: SELECT SentimentResults WHERE ColumnId = x
-        API->>DB: INSERT KpiAggregate (avg + counts)
+        SPS->>DB: SELECT SentimentResults WHERE ColumnId = x
+        SPS->>DB: INSERT KpiAggregate (avg + counts)
     end
 
-    API->>DB: UPDATE Survey (status=complete)
-    API-->>NG: 201 { id, name, status, sentimentAnalyzed }
-    NG->>NG: router.navigate(['/surveys', result.id])
-    NG->>User: Dashboard page rendered
+    SPS->>DB: UPDATE Survey status="complete"
+
+    Note over NG,DB: Angular polls GET /api/surveys/{id} every 2s
+    NG->>API: GET /api/surveys/{id}
+    API-->>NG: { status: "complete" }
+    NG->>NG: stopPolling()
+    NG->>User: Dashboard updated — spinner removed
 ```
 
 ---
@@ -193,7 +206,7 @@ crossing each boundary.
 |---|---|---|---|
 | List surveys | `GET /api/surveys` | — | `Survey[]` |
 | Get survey detail | `GET /api/surveys/{id}` | — | `SurveyDetail` (with `columns[]`) |
-| Upload CSV | `POST /api/surveys` | `multipart/form-data` file + optional name | `UploadResult` (201) |
+| Upload CSV | `POST /api/surveys` | `multipart/form-data` file + optional name | `{ id, name, status, totalRows, columnCount }` (202 Accepted) |
 
 ### ASP.NET Core → Python NLP
 

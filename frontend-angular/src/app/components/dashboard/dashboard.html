@@ -43,6 +43,20 @@
         </div>
       </div>
 
+      <!-- Processing / queued banner — shown while worker runs NLP -->
+      @if (survey.status === 'queued' || survey.status === 'processing') {
+        <div class="mt-4 flex items-center gap-2 bg-yellow-50 text-yellow-700 text-sm p-3 rounded-lg">
+          <svg class="animate-spin h-4 w-4 shrink-0" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
+          </svg>
+          <span>
+            @if (survey.status === 'queued') { Waiting in queue… }
+            @if (survey.status === 'processing') { Running sentiment analysis — this may take a minute… }
+          </span>
+        </div>
+      }
+
       <!-- Error message if processing failed -->
       @if (survey.errorMessage) {
         <div class="mt-4 bg-red-50 text-red-600 text-sm p-3 rounded-lg">

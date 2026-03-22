@@ -1,0 +1,60 @@
+<div class="max-w-4xl mx-auto">
+  <div class="flex justify-between items-center mb-6">
+    <h1 class="text-2xl font-bold text-gray-900">Surveys</h1>
+    <a routerLink="/upload"
+       class="bg-blue-600 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-blue-700 transition-colors">
+      Upload CSV
+    </a>
+  </div>
+
+  @if (loading) {
+    <div class="text-center py-16 text-gray-400">Loading...</div>
+  }
+
+  @if (error) {
+    <div class="bg-red-50 text-red-600 p-4 rounded-lg text-sm">{{ error }}</div>
+  }
+
+  @if (!loading && !error) {
+    @if (surveys.length === 0) {
+      <div class="text-center py-16 text-gray-400">
+        No surveys yet.
+        <a routerLink="/upload" class="text-blue-600 hover:underline ml-1">Upload your first CSV.</a>
+      </div>
+    } @else {
+      <div class="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
+        <table class="w-full text-sm">
+          <thead class="bg-gray-50 border-b border-gray-200">
+            <tr>
+              <th class="px-4 py-3 text-left font-medium text-gray-600">Name</th>
+              <th class="px-4 py-3 text-left font-medium text-gray-600">Status</th>
+              <th class="px-4 py-3 text-left font-medium text-gray-600">Rows</th>
+              <th class="px-4 py-3 text-left font-medium text-gray-600">Uploaded</th>
+              <th class="px-4 py-3"></th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-gray-100">
+            @for (survey of surveys; track survey.id) {
+              <tr class="hover:bg-gray-50 transition-colors">
+                <td class="px-4 py-3 font-medium text-gray-900">{{ survey.name }}</td>
+                <td class="px-4 py-3">
+                  <span class="px-2 py-0.5 rounded-full text-xs font-medium {{ statusClass(survey.status) }}">
+                    {{ survey.status }}
+                  </span>
+                </td>
+                <td class="px-4 py-3 text-gray-600">{{ survey.totalRows }}</td>
+                <td class="px-4 py-3 text-gray-500">{{ survey.uploadedAt | date:'mediumDate' }}</td>
+                <td class="px-4 py-3 text-right">
+                  <a [routerLink]="['/surveys', survey.id]"
+                     class="text-blue-600 hover:underline text-sm">
+                    View →
+                  </a>
+                </td>
+              </tr>
+            }
+          </tbody>
+        </table>
+      </div>
+    }
+  }
+</div>

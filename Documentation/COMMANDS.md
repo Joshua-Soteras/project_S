@@ -171,31 +171,45 @@ curl http://localhost:5120/api/surveys/1
 
 ## Frontend (Angular)
 
-**Working directory:** `frontend/`
+**Working directory:** `frontend-angular/`
 
-> **TODO:** Angular has not been scaffolded yet (Step 5 in the build order).
-> Commands will be added here once `ng new frontend` is run.
+> The Angular frontend lives in `frontend-angular/`. The original Nuxt scaffold in
+> `frontend/` is kept until Angular is confirmed as the final choice.
 
 ```bash
-# TODO: Scaffold Angular project (one-time)
-# cd to project root, then:
-ng new frontend --routing --style=scss
+# Install Angular CLI globally (one-time)
+npm install -g @angular/cli
 
-# TODO: Install dependencies
-cd frontend && npm install
+# Install project dependencies (run after cloning)
+cd frontend-angular && npm install
 
-# TODO: Start dev server (http://localhost:4200)
+# Start dev server with hot reload (http://localhost:4200)
+# API calls to /api are proxied to http://localhost:5120 via src/proxy.conf.json
 ng serve
 
-# TODO: Build for production
+# Build for production
 ng build --configuration production
 
-# TODO: Run unit tests
+# Run unit tests
 ng test --watch=false --code-coverage
 
-# TODO: Run end-to-end tests (Playwright)
+# Run end-to-end tests (Playwright — TODO: Step 7)
 npx playwright test
 ```
+
+**The Angular app runs at:** `http://localhost:4200`
+
+**Routes:**
+
+| Path | Component | Description |
+|---|---|---|
+| `/` | SurveyList | Lists all uploaded surveys |
+| `/upload` | Upload | CSV upload form |
+| `/surveys/:id` | Dashboard | Survey detail + detected columns |
+
+**Proxy config (`src/proxy.conf.json`):**
+All `/api/*` requests from Angular are forwarded to `http://localhost:5120` in
+development. No CORS configuration needed — the proxy handles it.
 
 ---
 

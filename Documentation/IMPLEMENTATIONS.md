@@ -454,3 +454,174 @@ SELECT label, COUNT(*) FROM "SentimentResults" GROUP BY label;
 # Verify KpiAggregates were computed
 SELECT * FROM "KpiAggregates";
 ```
+
+---
+
+## Step 5 — Angular Frontend MVP
+
+### What Was Built
+
+**`frontend-angular/`** — new Angular 21 project scaffolded alongside the existing
+Nuxt frontend. Nuxt (`frontend/`) is kept untouched until Angular is confirmed.
+
+---
+
+**`src/app/models/survey.model.ts`** — TypeScript interfaces:
+
+- `Survey` — summary shape from `GET /api/surveys` (id, name, status, totalRows,
+  processedRows, uploadedBy, uploadedAt, completedAt).
+- `SurveyDetail extends Survey` — adds `errorMessage` and `columns: SurveyColumn[]`,
+  returned by `GET /api/surveys/:id`.
+- `SurveyColumn` — id, columnName, columnType, analyzeSentiment, columnIndex.
+- `UploadResult` — shape returned by `POST /api/surveys` (id, name, status,
+  totalRows, columnCount, sentimentAnalyzed).
+
+Centralizing these means every component gets the same type — no duplicated
+interface definitions across files.
+
+---
+
+**`src/app/services/api.service.ts`** — HTTP wrapper:
+
+- `getSurveys()` → `GET /api/surveys`
+- `getSurvey(id)` → `GET /api/surveys/:id`
+- `uploadSurvey(file, name?)` → `POST /api/surveys` as `multipart/form-data`
+  via `FormData`. Angular sets `Content-Type` with the correct multipart boundary
+  automatically — no manual header needed.
+
+Uses Angular's `inject()` function (modern signal-style DI) instead of constructor
+injection. Registered `providedIn: 'root'` so the same instance is shared across
+all components.
+
+---
+
+**`src/app/components/survey-list/`** — Survey list page (`/`):
+
+- Calls `getSurveys()` on `ngOnInit`, stores results in a `surveys` array.
+- Shows a loading state, an error message if the API is unreachable, and an
+  empty-state prompt to upload if no surveys exist.
+- Renders a table with name, status badge (color-coded by status), row count,
+  upload date, and a "View →" link to the dashboard.
+- `statusClass(status)` helper maps status strings to Tailwind badge classes
+  (`complete` → green, `processing` → yellow, `error` → red, `queued` → gray).
+
+---
+
+**`src/app/components/upload/`** — CSV upload form (`/upload`):
+
+- File input filtered to `.csv` only. `onFileSelected()` stores the `File` object
+  and clears any previous error.
+- Optional survey name input via `[(ngModel)]` (two-way binding via `FormsModule`).
+- `onSubmit()` calls `uploadSurvey()`, disables the button during upload, and
+  on success navigates directly to `/surveys/:id` for the new survey.
+- Displays the API error message (`err.error?.error`) if the upload fails,
+  falling back to a generic message.
+- Shows a note during upload that sentiment analysis is running (since the
+  synchronous NLP loop can take several seconds for large files).
+
+---
+
+**`src/app/components/dashboard/`** — Survey detail page (`/surveys/:id`):
+
+- Reads the `id` route parameter via `ActivatedRoute.snapshot.paramMap`, calls
+  `getSurvey(id)` on init.
+- Header card: survey name, upload timestamp, status badge, processed row count.
+- Stats row: three metric cards — Total Rows, Processed, Columns.
+- Columns table: index, column name, type badge, and a "✓ Analyzed" indicator
+  for text columns flagged `analyzeSentiment = true`.
+- `pct(value)` helper formats 0–1 floats as percentage strings for future
+  KPI score display.
+- Error message card shown if `survey.errorMessage` is set.
+
+---
+
+**`src/app/app.routes.ts`** — Routes:
+
+| Path | Component |
+|---|---|
+| `/` | SurveyList |
+| `/upload` | Upload |
+| `/surveys/:id` | Dashboard |
+| `**` | redirect to `/` |
+
+---
+
+**`src/app/app.config.ts`** — added `provideHttpClient(withFetch())`:
+`withFetch()` uses the browser Fetch API instead of XMLHttpRequest — required
+for Angular SSR compatibility and is the modern default in Angular 17+.
+
+---
+
+**`src/app/app.html`** — replaced the default Angular welcome template with a
+top nav bar (dark background, Project S title, Surveys + Upload links with
+`routerLinkActive` highlighting) and a `<router-outlet>` for page content.
+
+---
+
+**`src/proxy.conf.json`** — dev proxy config:
+All requests to `/api/*` are forwarded to `http://localhost:5120` (the ASP.NET
+Core API). This means Angular components use relative `/api/surveys` paths that
+work in both development and production. No CORS headers needed.
+
+**`angular.json`** — `proxyConfig: "src/proxy.conf.json"` added to the
+`serve` options so the proxy activates automatically with `ng serve`.
+
+**`tailwind.config.js`** — `content: ['./src/**/*.{html,ts}']` added so
+Tailwind scans all Angular templates and component files for class names.
+
+**`src/styles.scss`** — added the three Tailwind directives (`@tailwind base`,
+`@tailwind components`, `@tailwind utilities`) replacing the empty default.
+
+### Applied From Planning Documents
+
+**`_5_ARCHITECTURE.md` — Service & Component Breakdown:**
+The Angular frontend box lists exactly the components built here:
+`CSV Upload Component`, `Survey List Component`, `API Service (HttpClient)`.
+The `Dashboard Component` and `Response Detail Component` are partially
+implemented — the dashboard shows column metadata for now; full KPI chart
+rendering (ng2-charts / Chart.js) is deferred to after Step 6 provides the
+KPI endpoint with real aggregate data.
+
+**`_5_ARCHITECTURE.md` — Data Flow:**
+`A5 (API Service) → B1 (Survey Endpoints)` is the only active data path in
+this step. `A5 → B2 (KPI Endpoints)` will be active in a future step once
+a `/api/kpis` endpoint is added to the backend.
+
+**`_6_TESTING_STRATEGY_AND_INTERVIEW_PREP.md` — Separation of Concerns:**
+`ApiService` is the only class that touches `HttpClient`. Components inject
+`ApiService` only — they never construct URLs or call `HttpClient` directly.
+This is the pattern the testing doc requires so components can be tested by
+providing a mock `ApiService` without spinning up a real HTTP server.
+
+### What Was Intentionally Left Out
+
+- **No KPI charts** — `GET /api/kpis` does not exist on the backend yet.
+  The dashboard shows column metadata and stats. Chart.js sentiment visualizations
+  will be added once the KPI endpoint is built.
+- **No polling for processing status** — if a large CSV takes time, the user
+  stays on the upload page until the response comes back. A polling mechanism
+  (periodic `GET /api/surveys/:id` checking `status`) will be added in Step 6
+  alongside the async queue.
+- **No form validation library** — upload validation is minimal (file presence
+  check, `.csv` extension filter). A proper reactive form with `FormBuilder`
+  will replace the template-driven form in a later step.
+- **No authentication UI** — `UploadedBy` is hardcoded to `"anonymous"` on the
+  backend. Azure Entra ID login is Step 8.
+
+### How to Test
+
+```bash
+# Start all services
+docker-compose up -d postgres
+cd nlp && uv run uvicorn app.main:app --reload &
+cd backend/src/_03_Web_API && dotnet run &
+
+# Start Angular dev server
+cd frontend-angular && ng serve
+
+# Open http://localhost:4200
+# - Survey list loads (empty on first run)
+# - Click "Upload CSV", select a .csv file, submit
+# - Redirects to /surveys/1 showing columns + stats
+# - Click "← Back to Surveys" to see the survey in the list
+```

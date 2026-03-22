@@ -1,0 +1,18 @@
+<nav class="bg-gray-900 text-white px-6 py-3 flex items-center gap-6 shadow-sm">
+  <span class="font-bold text-lg tracking-tight">Project S</span>
+  <a routerLink="/"
+     routerLinkActive="!text-blue-400"
+     [routerLinkActiveOptions]="{ exact: true }"
+     class="text-sm text-gray-300 hover:text-white transition-colors">
+    Surveys
+  </a>
+  <a routerLink="/upload"
+     routerLinkActive="!text-blue-400"
+     class="text-sm text-gray-300 hover:text-white transition-colors">
+    Upload
+  </a>
+</nav>
+
+<main class="min-h-screen bg-gray-50 p-8">
+  <router-outlet />
+</main>

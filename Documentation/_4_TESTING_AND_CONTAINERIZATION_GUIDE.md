@@ -502,3 +502,37 @@ docker exec -it projects_db psql -U projects_admin -d projects_db  # PostgreSQL 
       localhost:5432              localhost:5000
       (for DB tools)              (for API access)
 ```
+
+
+
+
+```
+Stop containers (keep data):
+
+
+docker-compose down
+Stop and delete all data (volumes):
+
+
+docker-compose down -v
+Stop a specific container:
+
+
+docker stop projects_db
+Other useful commands:
+
+
+# Pause (freeze) without stopping
+docker-compose pause
+
+# Resume paused containers
+docker-compose unpause
+
+# View running containers
+docker ps
+
+# View all containers (including stopped)
+docker ps -a
+
+
+```

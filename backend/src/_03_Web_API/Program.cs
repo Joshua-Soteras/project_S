@@ -11,6 +11,7 @@
 using Microsoft.EntityFrameworkCore;      // EF Core (UseNpgsql, Migrate, ToListAsync)
 using ProjectS.Infrastructure.Data;       // ApplicationDbContext
 using ProjectS.Core.Entities;             // User, TestItem entities
+using ProjectS.Web.Services;              // [ADDED] CsvParserService
 
 // ============================================
 // BUILDER PHASE - Configure Services
@@ -37,6 +38,14 @@ builder.Services.AddDbContext<ApplicationDbContext>(options =>
 // ----------------------------------------
 // Provides automatic API documentation at /openapi/v1.json
 builder.Services.AddOpenApi();
+
+// ----------------------------------------
+// [ADDED] REGISTER APPLICATION SERVICES
+// ----------------------------------------
+// AddScoped = one instance per HTTP request (same lifetime as DbContext).
+// CsvParserService reads an uploaded file and returns structured data.
+// It is injected into endpoints that need CSV parsing.
+builder.Services.AddScoped<CsvParserService>();
 
 // ============================================
 // BUILD THE APPLICATION
@@ -199,6 +208,245 @@ app.MapPost("/api/users", async (User user, ApplicationDbContext db) =>
     db.Users.Add(user);
     await db.SaveChangesAsync();
     return Results.Created($"/api/users/{user.Id}", user);
+});
+
+// ============================================
+// [ADDED] SURVEY ENDPOINTS
+// ============================================
+//
+// These endpoints handle the core feature of the application:
+// uploading a CSV of survey responses and processing it into
+// the database so the dashboard can display KPI data.
+//
+// CURRENT STATE (Step 2 — Synchronous):
+// Upload → parse → save to DB → return result.
+// The user waits for the full response.
+//
+// FUTURE STATE (Step 6 — Async Queue):
+// Upload → enqueue → return 202 immediately.
+// A background worker processes the CSV and updates the status.
+// ============================================
+
+// ----------------------------------------
+// POST /api/surveys — Upload and process a CSV file
+// ----------------------------------------
+// Accepts: multipart/form-data
+//   - file  (required) : the CSV file
+//   - name  (optional) : display name for the survey.
+//                        Defaults to the filename if not provided.
+//
+// Returns: 201 Created
+//   {
+//     "id": 1,
+//     "name": "Q1 Feedback",
+//     "status": "complete",
+//     "totalRows": 500,
+//     "columnCount": 6,
+//     "columns": [
+//       { "columnName": "How was your experience?", "columnType": "text", "analyzeSentiment": true },
+//       { "columnName": "Rating", "columnType": "numeric", "analyzeSentiment": false }
+//     ]
+//   }
+//
+// .DisableAntiforgery() is required for any endpoint that accepts
+// IFormFile in a minimal API. Since this is a pure API (not a
+// browser form), we don't need CSRF protection here.
+// ----------------------------------------
+app.MapPost("/api/surveys", async (
+    IFormFile file,
+    string? name,
+    CsvParserService parser,
+    ApplicationDbContext db) =>
+{
+    // --- VALIDATION ---
+    if (file is null || file.Length == 0)
+        return Results.BadRequest(new { error = "No file provided." });
+
+    if (!file.FileName.EndsWith(".csv", StringComparison.OrdinalIgnoreCase))
+        return Results.BadRequest(new { error = "Only .csv files are accepted." });
+
+    // --- PARSE THE CSV ---
+    // CsvParserService reads the file, detects column types,
+    // and returns structured data. If the file is malformed,
+    // it returns a 400 with the parser error message.
+    ParsedSurvey parsed;
+    try
+    {
+        parsed = await parser.ParseAsync(file);
+    }
+    catch (Exception ex)
+    {
+        return Results.BadRequest(new { error = $"Failed to parse CSV: {ex.Message}" });
+    }
+
+    if (parsed.Rows.Count == 0)
+        return Results.BadRequest(new { error = "The CSV file contains no data rows." });
+
+    // --- SAVE SURVEY RECORD ---
+    // Create the top-level Survey row first so we get its Id,
+    // which all child records (columns, responses, values) need as a FK.
+    var survey = new Survey
+    {
+        Name = name ?? Path.GetFileNameWithoutExtension(file.FileName),
+
+        // TODO (Step 8 — Azure): replace with the Azure Blob Storage URL
+        // after uploading the raw file to a "survey-csvs" container.
+        BlobUrl = file.FileName,
+
+        Status = "processing",
+        TotalRows = parsed.Rows.Count,
+
+        // TODO (Step 8 — Auth): replace with the authenticated user's
+        // Entra ID principal name (e.g. "john.doe@company.com").
+        UploadedBy = "anonymous",
+    };
+    db.Surveys.Add(survey);
+    await db.SaveChangesAsync(); // commit now to get survey.Id
+
+    // --- SAVE COLUMN DEFINITIONS ---
+    // One SurveyColumn row per header in the CSV.
+    // These describe the schema of this specific upload — because
+    // every CSV can have different columns, we store them per survey.
+    var columnEntities = parsed.Columns.Select(c => new SurveyColumn
+    {
+        SurveyId = survey.Id,
+        ColumnName = c.Name,
+        ColumnType = c.Type,
+        ColumnIndex = c.Index,
+        AnalyzeSentiment = c.AnalyzeSentiment,
+    }).ToList();
+
+    db.SurveyColumns.AddRange(columnEntities);
+    await db.SaveChangesAsync(); // commit now to get column Ids
+
+    // --- SAVE RESPONSES AND CELL VALUES IN BATCHES ---
+    // Processing in batches of 500 rows at a time prevents a single
+    // large SaveChangesAsync() call from holding a DB transaction open
+    // for too long, which can cause lock contention under load.
+    //
+    // EF Core navigation property pattern:
+    //   response.Values = [list of ResponseValue]
+    // When we call SaveChangesAsync(), EF Core automatically sets
+    // ResponseId on each ResponseValue to match response.Id.
+    // We don't have to set it manually.
+    const int batchSize = 500;
+
+    for (var i = 0; i < parsed.Rows.Count; i += batchSize)
+    {
+        var batch = parsed.Rows.Skip(i).Take(batchSize);
+
+        var responseEntities = batch.Select(row =>
+        {
+            var response = new SurveyResponse
+            {
+                SurveyId = survey.Id,
+                RowIndex = row.RowIndex,
+            };
+
+            // Attach all cells for this row via the navigation property.
+            // EF Core will resolve the FK (ResponseId) automatically on save.
+            response.Values = row.Cells
+                .Where(cell => cell.ColumnIndex < columnEntities.Count)
+                .Select(cell => new ResponseValue
+                {
+                    // Link each cell to its column definition by Id
+                    ColumnId = columnEntities[cell.ColumnIndex].Id,
+                    RawValue = cell.Value,
+                }).ToList();
+
+            return response;
+        }).ToList();
+
+        db.SurveyResponses.AddRange(responseEntities);
+        await db.SaveChangesAsync();
+    }
+
+    // --- MARK COMPLETE ---
+    survey.Status = "complete";
+    survey.ProcessedRows = parsed.Rows.Count;
+    survey.CompletedAt = DateTime.UtcNow;
+    await db.SaveChangesAsync();
+
+    return Results.Created($"/api/surveys/{survey.Id}", new
+    {
+        survey.Id,
+        survey.Name,
+        survey.Status,
+        survey.TotalRows,
+        ColumnCount = columnEntities.Count,
+        Columns = columnEntities.Select(c => new
+        {
+            c.ColumnName,
+            c.ColumnType,
+            c.AnalyzeSentiment,
+        }),
+    });
+}).DisableAntiforgery();
+
+// ----------------------------------------
+// GET /api/surveys — List all surveys
+// ----------------------------------------
+// Returns a summary list — no columns or row data included.
+// Ordered newest first.
+// ----------------------------------------
+app.MapGet("/api/surveys", async (ApplicationDbContext db) =>
+{
+    var surveys = await db.Surveys
+        .OrderByDescending(s => s.UploadedAt)
+        .Select(s => new
+        {
+            s.Id,
+            s.Name,
+            s.Status,
+            s.TotalRows,
+            s.ProcessedRows,
+            s.UploadedBy,
+            s.UploadedAt,
+            s.CompletedAt,
+        })
+        .ToListAsync();
+
+    return Results.Ok(surveys);
+});
+
+// ----------------------------------------
+// GET /api/surveys/{id} — Get a single survey with its columns
+// ----------------------------------------
+// Returns the survey metadata and all detected column definitions.
+// Use this to know what columns exist before querying responses.
+// ----------------------------------------
+app.MapGet("/api/surveys/{id}", async (int id, ApplicationDbContext db) =>
+{
+    // Include(s => s.Columns) = JOIN to SurveyColumns table
+    // This is EF Core's way of eager-loading a related collection.
+    var survey = await db.Surveys
+        .Include(s => s.Columns)
+        .FirstOrDefaultAsync(s => s.Id == id);
+
+    if (survey is null) return Results.NotFound();
+
+    return Results.Ok(new
+    {
+        survey.Id,
+        survey.Name,
+        survey.Status,
+        survey.TotalRows,
+        survey.ProcessedRows,
+        survey.ErrorMessage,
+        survey.UploadedBy,
+        survey.UploadedAt,
+        survey.CompletedAt,
+        Columns = survey.Columns
+            .OrderBy(c => c.ColumnIndex)
+            .Select(c => new
+            {
+                c.Id,
+                c.ColumnName,
+                c.ColumnType,
+                c.AnalyzeSentiment,
+                c.ColumnIndex,
+            }),
+    });
 });
 
 // ============================================

@@ -47,6 +47,23 @@ builder.Services.AddOpenApi();
 // It is injected into endpoints that need CSV parsing.
 builder.Services.AddScoped<CsvParserService>();
 
+// ----------------------------------------
+// [ADDED] REGISTER SENTIMENT CLIENT (TYPED HTTPCLIENT)
+// ----------------------------------------
+// AddHttpClient<T>() registers SentimentClient as a typed HttpClient.
+// It manages the underlying HttpClientHandler lifetime (connection pooling,
+// DNS refresh) automatically — no manual HttpClient creation or disposal.
+//
+// BaseAddress is read from config:
+//   Development : appsettings.Development.json → http://localhost:8000
+//   Docker      : appsettings.json             → http://nlp:8000
+//                 ("nlp" is the docker-compose service name)
+builder.Services.AddHttpClient<SentimentClient>(client =>
+{
+    var url = builder.Configuration["NlpService:BaseUrl"] ?? "http://localhost:8000";
+    client.BaseAddress = new Uri(url);
+});
+
 // ============================================
 // BUILD THE APPLICATION
 // ============================================
@@ -256,6 +273,7 @@ app.MapPost("/api/surveys", async (
     IFormFile file,
     string? name,
     CsvParserService parser,
+    SentimentClient sentiment,
     ApplicationDbContext db) =>
 {
     // --- VALIDATION ---
@@ -361,6 +379,112 @@ app.MapPost("/api/surveys", async (
         await db.SaveChangesAsync();
     }
 
+    // ============================================
+    // [ADDED] SENTIMENT ANALYSIS
+    // ============================================
+    //
+    // For every ResponseValue in a text column, call the Python NLP
+    // service (POST /analyze) and save a SentimentResult row.
+    //
+    // Then compute KpiAggregates — one per text column summarizing all
+    // sentiment results. The dashboard reads from KpiAggregates instead
+    // of running live AVG/COUNT queries over ResponseValues at runtime.
+    //
+    // TODO (Step 6 — Async Queue):
+    // This block moves into a background worker that pulls from a queue.
+    // The endpoint will return 202 Accepted immediately after saving the
+    // CSV rows, and a worker processes NLP asynchronously.
+    // ============================================
+
+    // --- IDENTIFY TEXT COLUMNS ---
+    // Only columns flagged AnalyzeSentiment=true (i.e. type "text") get
+    // sent to the NLP service. Numeric/date/boolean columns are skipped.
+    var textColumnIds = columnEntities
+        .Where(c => c.AnalyzeSentiment)
+        .Select(c => c.Id)
+        .ToHashSet();
+
+    var sentimentCount = 0;
+
+    if (textColumnIds.Count > 0)
+    {
+        // --- LOAD TEXT RESPONSE VALUES ---
+        // Query all ResponseValues for text columns.
+        // We query after the batch save so every record has a DB-assigned Id,
+        // which is needed as the FK on SentimentResult.
+        var textValues = await db.ResponseValues
+            .Where(rv => textColumnIds.Contains(rv.ColumnId) && rv.RawValue != null)
+            .ToListAsync();
+
+        // --- CALL NLP SERVICE IN BATCHES ---
+        // Process in batches of 100 to avoid holding too many in-flight
+        // HTTP requests at once. Each AnalyzeAsync call is one round trip
+        // to the Python service.
+        const int nlpBatchSize = 100;
+
+        for (var i = 0; i < textValues.Count; i += nlpBatchSize)
+        {
+            var batch = textValues.Skip(i).Take(nlpBatchSize);
+            var sentimentEntities = new List<SentimentResult>();
+
+            foreach (var rv in batch)
+            {
+                // Skip blank cells — the NLP service rejects empty strings
+                // and they represent missing responses, not actual sentiment.
+                if (string.IsNullOrWhiteSpace(rv.RawValue)) continue;
+
+                // Call POST /analyze on the Python NLP service.
+                // Returns null if the service is unavailable or returns
+                // a non-success status. We skip those rows rather than
+                // failing the whole upload.
+                var nlpResult = await sentiment.AnalyzeAsync(rv.RawValue);
+                if (nlpResult is null) continue;
+
+                sentimentEntities.Add(new SentimentResult
+                {
+                    ResponseValueId = rv.Id,
+                    Label = nlpResult.Label,
+                    PositiveScore = nlpResult.Positive,
+                    NeutralScore = nlpResult.Neutral,
+                    NegativeScore = nlpResult.Negative,
+                });
+            }
+
+            db.SentimentResults.AddRange(sentimentEntities);
+            await db.SaveChangesAsync();
+            sentimentCount += sentimentEntities.Count;
+        }
+
+        // --- COMPUTE KPI AGGREGATES ---
+        // One KpiAggregate row per text column — pre-computed averages
+        // and label counts that the dashboard reads directly.
+        foreach (var columnId in textColumnIds)
+        {
+            // Load all SentimentResults for this column, navigating through
+            // ResponseValue to match by ColumnId.
+            var columnResults = await db.SentimentResults
+                .Where(sr => sr.ResponseValue.ColumnId == columnId)
+                .ToListAsync();
+
+            if (columnResults.Count == 0) continue;
+
+            db.KpiAggregates.Add(new KpiAggregate
+            {
+                SurveyId = survey.Id,
+                ColumnId = columnId,
+                TotalResponses = columnResults.Count,
+                AvgPositive = (float)columnResults.Average(r => r.PositiveScore),
+                AvgNeutral = (float)columnResults.Average(r => r.NeutralScore),
+                AvgNegative = (float)columnResults.Average(r => r.NegativeScore),
+                CountPositive = columnResults.Count(r => r.Label == "positive"),
+                CountNeutral = columnResults.Count(r => r.Label == "neutral"),
+                CountNegative = columnResults.Count(r => r.Label == "negative"),
+            });
+        }
+
+        await db.SaveChangesAsync();
+    }
+
     // --- MARK COMPLETE ---
     survey.Status = "complete";
     survey.ProcessedRows = parsed.Rows.Count;
@@ -374,6 +498,7 @@ app.MapPost("/api/surveys", async (
         survey.Status,
         survey.TotalRows,
         ColumnCount = columnEntities.Count,
+        SentimentAnalyzed = sentimentCount,
         Columns = columnEntities.Select(c => new
         {
             c.ColumnName,

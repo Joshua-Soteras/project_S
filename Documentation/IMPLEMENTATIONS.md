@@ -315,3 +315,142 @@ curl -X POST http://localhost:8000/analyze \
   -d '{"text": ""}'
 # → 400 {"detail":"text must not be empty or whitespace-only."}
 ```
+
+---
+
+## Step 4 — SentimentClient + NLP Wiring into ASP.NET Core
+
+### What Was Built
+
+**`Services/SentimentClient.cs`** added to `_03_Web_API/Services/`:
+
+A typed `HttpClient` wrapper responsible solely for communicating with the
+Python NLP service. It has no database dependency — it only makes HTTP calls
+and returns typed result objects. This separation means it can be unit tested
+by mocking `HttpClient` without needing the NLP service running.
+
+Two types defined alongside the client:
+- `SentimentRequest(string Text)` — the JSON body sent to `POST /analyze`.
+  `Text` serializes as `"text"` automatically via `JsonSerializerDefaults.Web`
+  (camelCase policy applied by `PostAsJsonAsync`).
+- `SentimentResponse(string Label, float Positive, float Neutral, float Negative)` —
+  the deserialized response from the NLP service. Case-insensitive deserialization
+  means `"label"` → `Label`, `"positive"` → `Positive`, etc. without any
+  `[JsonPropertyName]` attributes.
+
+`AnalyzeAsync(string text)` returns `null` on non-success HTTP status rather
+than throwing — so a temporarily unavailable NLP service skips individual cells
+instead of failing the entire upload.
+
+Uses C# 12 primary constructor: `SentimentClient(HttpClient http)`.
+
+**`Program.cs`** — three changes:
+
+1. **`AddHttpClient<SentimentClient>` registration** — registers the client as
+   a typed `HttpClient` with a pre-configured `BaseAddress` read from config.
+   `AddHttpClient` manages the underlying `HttpClientHandler` lifetime (connection
+   pooling, DNS refresh) so there is no manual `HttpClient` construction or disposal.
+   `NlpService:BaseUrl` resolves to:
+   - `http://localhost:8000` in Development (direct `uv run uvicorn` process)
+   - `http://nlp:8000` in Docker (docker-compose service name resolution)
+
+2. **`SentimentClient sentiment` parameter** injected into `POST /api/surveys` —
+   DI automatically provides the pre-configured instance.
+
+3. **NLP processing block** added after the CSV batch-save loop:
+   - Identifies text column IDs (`AnalyzeSentiment = true`).
+   - Queries all `ResponseValue` rows for those columns from the DB (after the
+     batch save, so every row has a DB-assigned `Id` available as a FK).
+   - Calls `AnalyzeAsync` in batches of 100 to avoid too many in-flight HTTP
+     requests at once. Skips blank cells and failed NLP calls rather than
+     aborting the upload.
+   - Saves `SentimentResult` entities (one per non-blank text cell) in batches.
+   - Computes one `KpiAggregate` per text column — average scores and label
+     counts across all results for that column. Written once when processing
+     completes; dashboard reads this flat row instead of running live aggregations.
+   - `SentimentAnalyzed` count added to the `POST /api/surveys` 201 response
+     so the caller knows how many cells were analyzed.
+
+**`appsettings.json`** — added `NlpService.BaseUrl = "http://nlp:8000"` (Docker default).
+
+**`appsettings.Development.json`** — added `NlpService.BaseUrl = "http://localhost:8000"` (local dev).
+
+### Applied From Planning Documents
+
+**`_5_ARCHITECTURE.md` — Service & Component Breakdown:**
+`SentimentClient` directly implements the `SentimentClient (HttpClient wrapper)`
+component defined in the ASP.NET Core service breakdown diagram. The architecture
+specified it as a dedicated wrapper class, not inline HttpClient calls in the endpoint.
+
+**`_5_ARCHITECTURE.md` — CSV Upload & Processing Flow:**
+The sequence diagram shows the loop:
+`For each row × text column → API: POST /analyze → NLP: { label, positive, neutral, negative }`.
+The batch processing loop in `POST /api/surveys` implements exactly this, then
+`INSERT SentimentResults` and `UPDATE Survey status=Complete` as shown.
+
+**`_5_ARCHITECTURE.md` — ER Diagram:**
+`SentimentResult` is one-to-one with `ResponseValue` (enforced by unique index
+on `ResponseValueId` from the migration). `KpiAggregate` is one per survey×column
+(enforced by unique composite index). Both constraints prevent duplicate processing
+if the endpoint is accidentally called twice.
+
+**`_6_TESTING_STRATEGY_AND_INTERVIEW_PREP.md` — Separation of Concerns:**
+`SentimentClient` is kept pure (no DB dependency) so unit tests can inject a
+mock `HttpMessageHandler` and test `AnalyzeAsync` without a running NLP service.
+The testing doc calls this out explicitly as a required test target.
+
+**`_7_SCALABILITY_AND_PRODUCTION_DESIGN.md` — Async Processing:**
+Two `TODO (Step 6)` comments mark exactly where the synchronous NLP processing
+loop will be replaced with an async queue pattern (Azure Service Bus / .NET Channel).
+The endpoint currently blocks until all NLP calls complete — acceptable for Step 4
+development, but will not scale for large CSVs with hundreds of text columns.
+
+**`_7_SCALABILITY_AND_PRODUCTION_DESIGN.md` — Database Design for Scale:**
+`KpiAggregate` was always the intended read target for the dashboard. This step
+is where the writes finally happen — the NLP worker (inline for now, background
+worker in Step 6) computes and persists the aggregates once per survey.
+
+### What Was Intentionally Left Out
+
+- **No retry policy** — if the NLP service returns a non-200, the cell is skipped
+  silently. A Polly retry policy (exponential backoff) will be added when `HttpClient`
+  registration is hardened in Step 6/7.
+- **No partial failure tracking** — if the NLP service is down for half the cells,
+  the survey still completes without flagging which cells were skipped. An
+  `ErrorMessage` field on `Survey` is available for this; it will be wired in Step 6.
+- **No async queue** — the user still waits synchronously for all NLP calls to
+  complete. Marked `TODO (Step 6)`.
+
+### How to Test
+
+```bash
+# Prerequisites: postgres running, NLP service running
+docker-compose up -d postgres
+cd nlp && uv run uvicorn app.main:app --reload &
+cd backend/src/_03_Web_API && dotnet run
+
+# Upload a CSV that has at least one text column
+curl -X POST http://localhost:5120/api/surveys \
+  -F "file=@/path/to/survey.csv"
+
+# Expected response now includes SentimentAnalyzed count
+# {
+#   "id": 1,
+#   "name": "survey",
+#   "status": "complete",
+#   "totalRows": 50,
+#   "columnCount": 3,
+#   "sentimentAnalyzed": 50,
+#   "columns": [
+#     { "columnName": "Feedback", "columnType": "text", "analyzeSentiment": true },
+#     { "columnName": "Rating",   "columnType": "numeric", "analyzeSentiment": false }
+#   ]
+# }
+
+# Verify SentimentResults were written to the database
+docker exec -it projects_db psql -U projects_admin -d projects_db
+SELECT label, COUNT(*) FROM "SentimentResults" GROUP BY label;
+
+# Verify KpiAggregates were computed
+SELECT * FROM "KpiAggregates";
+```

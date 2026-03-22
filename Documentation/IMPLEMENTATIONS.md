@@ -625,3 +625,163 @@ cd frontend-angular && ng serve
 # - Redirects to /surveys/1 showing columns + stats
 # - Click "← Back to Surveys" to see the survey in the list
 ```
+
+---
+
+## Step 6 — Async Queue Pattern (Channel\<int\> + BackgroundService)
+
+### What Was Built
+
+**`Workers/SurveyQueue.cs`** — singleton in-memory queue:
+
+A thin wrapper around `System.Threading.Channels.Channel<int>`. Holds survey
+IDs that are waiting for NLP processing. Registered as a singleton so the channel
+lives for the full app lifetime (outlives any individual HTTP request or background job).
+
+Key design choices:
+- `Channel.CreateUnbounded<int>` — no upper limit on queued items.
+- `UnboundedChannelOptions { SingleReader = true }` — enables internal channel
+  optimisations because only one consumer (the worker) reads from it.
+- `TryWrite(surveyId)` — non-blocking write from the HTTP endpoint.
+- `ChannelReader<int> Reader` — exposed to the background worker for async reads.
+  `ReadAllAsync()` suspends the worker thread when the queue is empty with no
+  polling or busy-waiting.
+
+**`Services/SurveyProcessingService.cs`** — scoped NLP + KPI pipeline:
+
+Contains the full sentiment analysis and KPI computation logic that was
+previously inline in `POST /api/surveys` (Step 4). Extracted into its own
+class so the background worker can call it with a dedicated DI scope per job.
+
+`ProcessAsync(int surveyId, CancellationToken ct)` pipeline:
+1. Loads the survey by ID. Sets `status = "processing"`, saves immediately
+   so the dashboard can show a "running" state while work happens.
+2. Queries all `SurveyColumn` rows for the survey with `AnalyzeSentiment = true`.
+3. Loads all `ResponseValue` rows for those columns.
+4. Calls `SentimentClient.AnalyzeAsync()` in batches of 100. Skips blank cells
+   and null results (NLP service down). Saves `SentimentResult` rows per batch.
+5. Computes one `KpiAggregate` per text column: avg scores and label counts
+   across all `SentimentResult` rows for that column.
+6. Sets `status = "complete"`, `ProcessedRows`, `CompletedAt`. Saves.
+7. On `Exception`: sets `status = "error"`, writes `ex.Message` to
+   `survey.ErrorMessage`. Uses `CancellationToken.None` for this save so it
+   completes even during app shutdown.
+8. On `OperationCanceledException` (app shutdown): logs the cancellation,
+   re-throws to stop the loop cleanly. Survey stays in `"processing"` state.
+
+**`Workers/SurveyProcessingWorker.cs`** — hosted background service:
+
+A `BackgroundService` (automatically singleton) that runs for the full app
+lifetime alongside the HTTP server. Its `ExecuteAsync()` loop:
+1. Awaits survey IDs from `SurveyQueue.Reader.ReadAllAsync(stoppingToken)`.
+   The `await foreach` suspends here when the queue is empty — no CPU usage.
+2. For each ID, creates a new `IServiceScope` via `IServiceScopeFactory`.
+   The scope provides a fresh `ApplicationDbContext` and `SentimentClient`
+   per job — essential because `DbContext` is scoped and cannot be shared
+   across concurrent operations or retained between jobs.
+3. Resolves `SurveyProcessingService` from the scope and calls `ProcessAsync()`.
+4. Catches `OperationCanceledException` to exit the loop cleanly on shutdown.
+5. Outer `catch (Exception)` is a safety net in case `ProcessAsync` itself
+   throws unexpectedly (error is already written to the survey by the service).
+
+**`Program.cs`** — three registration additions, endpoint simplified:
+
+New service registrations (builder phase):
+```csharp
+builder.Services.AddSingleton<SurveyQueue>();
+builder.Services.AddScoped<SurveyProcessingService>();
+builder.Services.AddHostedService<SurveyProcessingWorker>();
+```
+
+`POST /api/surveys` changes:
+- `SentimentClient sentiment` parameter removed (no longer needed at the endpoint level).
+- `SurveyQueue queue` parameter added.
+- `survey.Status` changed from `"processing"` to `"queued"` at creation.
+- Entire NLP + KPI block removed — replaced with `queue.Enqueue(survey.Id)`.
+- Return changed from `201 Created` to `202 Accepted` — semantically correct
+  since the resource is created but processing is deferred.
+- Response body simplified (no `SentimentAnalyzed` count since NLP hasn't run yet).
+
+**`frontend-angular/src/app/components/dashboard/dashboard.ts`** — polling added:
+
+The dashboard now implements `OnDestroy` alongside `OnInit`. After the initial
+`getSurvey()` call:
+- If status is `queued` or `processing`, `startPolling(id)` is called.
+- Every 2 seconds, `getSurvey(id)` is called and `this.survey` is updated.
+- When status transitions to `complete` or `error`, `stopPolling()` is called.
+- `ngOnDestroy()` always calls `stopPolling()` to clear the `setInterval`
+  timer and prevent memory leaks if the user navigates away before completion.
+- Poll errors are swallowed — a transient 500 during polling just delays the
+  next update without showing an error to the user.
+
+**`frontend-angular/src/app/components/dashboard/dashboard.html`** — processing banner:
+
+A yellow spinner banner is shown while `status` is `queued` or `processing`:
+- "Waiting in queue…" when status = `queued`.
+- "Running sentiment analysis — this may take a minute…" when status = `processing`.
+- Spinner uses Tailwind's `animate-spin` on an inline SVG.
+- Banner disappears automatically when polling updates the survey to `complete`.
+
+### Applied From Planning Documents
+
+**`_5_ARCHITECTURE.md` — Async Processing:**
+The architecture document calls for a `.NET Channel<T>` as the local async
+queue implementation (Step 6 scope), with Azure Service Bus as the production
+swap in Step 8. `SurveyQueue` is designed with exactly this swap in mind —
+only the registration in `Program.cs` and the `SurveyQueue` class itself change
+to move to Service Bus. `SurveyProcessingWorker` and `SurveyProcessingService`
+remain identical.
+
+**`_7_SCALABILITY_AND_PRODUCTION_DESIGN.md` — Async Processing:**
+The scalability doc identified that synchronous NLP processing in an HTTP
+request handler doesn't scale. A 500-row CSV with 3 text columns = 1,500 NLP
+calls during the request. At ~50ms per call that's 75 seconds of blocked HTTP.
+The `202 Accepted + background worker` pattern removes this entirely.
+
+**`_6_TESTING_STRATEGY_AND_INTERVIEW_PREP.md` — Separation of Concerns:**
+`SurveyProcessingService` is a clean, injectable service that can be unit tested
+by providing mock `ApplicationDbContext` and `SentimentClient`. The `CancellationToken`
+threading through the method makes it testable for cancellation scenarios too.
+
+### What Was Intentionally Left Out
+
+- **No re-delivery on crash** — if the app crashes while a survey is processing,
+  the survey stays stuck in `"processing"`. An in-memory `Channel<T>` does not
+  survive app restarts. Azure Service Bus (Step 8) provides at-least-once delivery
+  with message locking to solve this.
+- **No concurrency** — the worker processes one survey at a time. Parallelism
+  can be added by running multiple worker instances (`AddHostedService` called
+  multiple times) but is not needed at current scale.
+- **No Polly retry on NLP calls** — if the NLP service is down, cells are skipped
+  silently. A retry policy with exponential backoff will be added in Step 7.
+- **No progress updates** — `ProcessedRows` is only written at completion.
+  Incremental progress (updating every batch) would make the dashboard more
+  informative but adds write overhead.
+
+### How to Test
+
+```bash
+# Start all services
+docker-compose up -d postgres
+cd nlp && uv run uvicorn app.main:app --reload &
+cd backend/src/_03_Web_API && dotnet run &
+cd frontend-angular && ng serve
+
+# Upload a CSV via the API — now returns 202 immediately
+curl -X POST http://localhost:5120/api/surveys \
+  -F "file=@/path/to/survey.csv"
+# Response: 202 Accepted
+# { "id": 1, "name": "survey", "status": "queued", "totalRows": 500, "columnCount": 3 }
+
+# Poll until complete
+curl http://localhost:5120/api/surveys/1
+# status transitions: queued → processing → complete
+
+# Or open http://localhost:4200, upload a CSV, and watch the dashboard
+# spinner update automatically as the worker processes in the background.
+
+# Verify background processing in dotnet run console logs:
+# info: SurveyProcessingWorker — Dequeued survey 1 for processing
+# info: SurveyProcessingService — Survey 1: processed NLP batch 1/5
+# info: SurveyProcessingService — Survey 1 complete — 50 sentiment results
+```

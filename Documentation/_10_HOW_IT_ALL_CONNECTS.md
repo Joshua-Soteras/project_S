@@ -17,6 +17,9 @@ graph TD
         W1["Program.cs\n(endpoints + DI registration)"]
         W2["Services/CsvParserService.cs"]
         W3["Services/SentimentClient.cs"]
+        W4["Services/SurveyProcessingService.cs\n(NLP + KPI pipeline — scoped)"]
+        W5["Workers/SurveyQueue.cs\n(Channel&lt;int&gt; wrapper — singleton)"]
+        W6["Workers/SurveyProcessingWorker.cs\n(BackgroundService — singleton)"]
     end
 
     subgraph Infra["_02_Infrastructure  ·  ProjectS.Infrastructure"]
@@ -48,7 +51,7 @@ framework dependencies. This keeps entities portable and independently testable.
 |---|---|---|---|
 | Core | `_01_Core.csproj` | `ProjectS.Core` | Entity classes only. Pure C#, no EF, no ASP.NET. |
 | Infrastructure | `_02_Infrastructure.csproj` | `ProjectS.Infrastructure` | `ApplicationDbContext`, EF Core config, migrations. |
-| Web API | `_03_Web_API.csproj` | `ProjectS.Web` | `Program.cs` (endpoints), `CsvParserService`, `SentimentClient`. |
+| Web API | `_03_Web_API.csproj` | `ProjectS.Web` | `Program.cs` (endpoints), `CsvParserService`, `SentimentClient`, `SurveyProcessingService`, `SurveyQueue`, `SurveyProcessingWorker`. |
 
 ---
 
@@ -260,9 +263,7 @@ classDiagram
 
 ## 4. Service Class Diagram
 
-The two services in `_03_Web_API/Services/` do all the processing work.
-Neither touches the database directly — they return data, and `Program.cs`
-saves it.
+Services live in `_03_Web_API/Services/` and `_03_Web_API/Workers/`.
 
 ```mermaid
 classDiagram
@@ -310,6 +311,27 @@ classDiagram
         +float Negative
     }
 
+    class SurveyQueue {
+        -Channel~int~ _channel
+        +Enqueue(int surveyId) void
+        +Reader ChannelReader~int~
+    }
+
+    class SurveyProcessingService {
+        -ApplicationDbContext db
+        -SentimentClient sentiment
+        -ILogger logger
+        -int NlpBatchSize = 100
+        +ProcessAsync(int surveyId, CancellationToken) Task
+    }
+
+    class SurveyProcessingWorker {
+        -SurveyQueue queue
+        -IServiceScopeFactory scopeFactory
+        -ILogger logger
+        #ExecuteAsync(CancellationToken) Task
+    }
+
     class ApplicationDbContext {
         +DbSet~Survey~ Surveys
         +DbSet~SurveyColumn~ SurveyColumns
@@ -328,6 +350,10 @@ classDiagram
     ParsedRow        "1" *-- "0..*" ParsedCell
     SentimentClient  ..> SentimentRequest  : sends
     SentimentClient  ..> SentimentResponse : receives
+    SurveyProcessingWorker --> SurveyQueue : reads from
+    SurveyProcessingWorker --> SurveyProcessingService : calls per job
+    SurveyProcessingService --> SentimentClient : calls
+    SurveyProcessingService --> ApplicationDbContext : reads/writes
 ```
 
 ---
@@ -340,13 +366,16 @@ All service registration happens in `Program.cs` during the **builder phase**
 ```mermaid
 graph LR
     subgraph DI["DI Container (Program.cs — builder phase)"]
-        A["AddDbContext&lt;ApplicationDbContext&gt;\nLifetime: Scoped\nConfig: NpgsqlConnection from appsettings"]
-        B["AddScoped&lt;CsvParserService&gt;\nLifetime: Scoped\nNo dependencies"]
-        C["AddHttpClient&lt;SentimentClient&gt;\nLifetime: Transient (managed)\nBaseAddress: NlpService:BaseUrl from config"]
+        A["AddDbContext&lt;ApplicationDbContext&gt;\nLifetime: Scoped"]
+        B["AddScoped&lt;CsvParserService&gt;\nLifetime: Scoped"]
+        C["AddHttpClient&lt;SentimentClient&gt;\nLifetime: Transient (managed)\nBaseAddress: NlpService:BaseUrl"]
+        D["AddSingleton&lt;SurveyQueue&gt;\nChannel&lt;int&gt; lives for app lifetime"]
+        E["AddScoped&lt;SurveyProcessingService&gt;\nResolved per background job"]
+        F["AddHostedService&lt;SurveyProcessingWorker&gt;\nStarts with app, reads from SurveyQueue"]
     end
 
     subgraph Endpoints["Endpoints (Program.cs — app phase)"]
-        E1["POST /api/surveys\nparams: IFormFile, string?, CsvParserService, SentimentClient, ApplicationDbContext"]
+        E1["POST /api/surveys\nparams: IFormFile, string?, CsvParserService, SurveyQueue, ApplicationDbContext"]
         E2["GET /api/surveys\nparams: ApplicationDbContext"]
         E3["GET /api/surveys/{id}\nparams: int, ApplicationDbContext"]
     end
@@ -355,7 +384,10 @@ graph LR
     A --> E2
     A --> E3
     B --> E1
-    C --> E1
+    D --> E1
+    D --> F
+    E --> F
+    C --> E
 ```
 
 **Config resolution for `SentimentClient.BaseAddress`:**
@@ -370,36 +402,35 @@ to the container's IP automatically.
 
 ---
 
-## 6. Request Lifecycle — POST /api/surveys
+## 6. Request Lifecycle — POST /api/surveys (Async, Step 6+)
 
-This is the most complex endpoint. It touches every layer and every service.
+The endpoint now returns `202 Accepted` immediately after persisting CSV rows.
+NLP + KPI computation runs in the background via `SurveyProcessingWorker`.
 
 ```mermaid
 sequenceDiagram
     participant Client
-    participant EP  as Program.cs\nPOST /api/surveys
-    participant CSV as CsvParserService\n.ParseAsync()
-    participant DB  as ApplicationDbContext\n(PostgreSQL)
-    participant SC  as SentimentClient\n.AnalyzeAsync()
-    participant NLP as Python FastAPI\nPOST /analyze
+    participant EP   as Program.cs\nPOST /api/surveys
+    participant CSV  as CsvParserService\n.ParseAsync()
+    participant DB   as ApplicationDbContext\n(PostgreSQL)
+    participant Q    as SurveyQueue\nChannel&lt;int&gt;
+    participant W    as SurveyProcessingWorker\n(BackgroundService)
+    participant SPS  as SurveyProcessingService\n.ProcessAsync()
+    participant SC   as SentimentClient\n.AnalyzeAsync()
+    participant NLP  as Python FastAPI\nPOST /analyze
 
     Client->>EP: multipart/form-data (file, name?)
 
     Note over EP: Phase 1 — Validate
-    EP->>EP: Check file != null, file.Length > 0
-    EP->>EP: Check file.FileName ends with .csv
+    EP->>EP: Check file != null, .csv extension
 
     Note over EP,CSV: Phase 2 — Parse CSV
     EP->>CSV: ParseAsync(IFormFile)
-    CSV->>CSV: new CsvReader(StreamReader, config)
-    CSV->>CSV: ReadAsync() header → headers[]
-    CSV->>CSV: ReadAsync() rows → rawRows[][]
-    CSV->>CSV: DetectColumnType() per column (sample 20 values)
-    CSV->>CSV: Build ParsedColumn[] + ParsedRow[]
+    CSV->>CSV: Read headers + rows, detect column types
     CSV-->>EP: ParsedSurvey { Columns[], Rows[] }
 
-    Note over EP,DB: Phase 3 — Save Survey record
-    EP->>DB: INSERT Survey (status=processing)
+    Note over EP,DB: Phase 3 — Save Survey (status=queued)
+    EP->>DB: INSERT Survey (status="queued")
     DB-->>EP: survey.Id assigned
 
     Note over EP,DB: Phase 4 — Save column definitions
@@ -408,37 +439,45 @@ sequenceDiagram
 
     Note over EP,DB: Phase 5 — Save rows + cells (batches of 500)
     loop Every 500 parsed rows
-        EP->>EP: Build SurveyResponse + ResponseValue[]\nvia navigation properties
+        EP->>EP: Build SurveyResponse + ResponseValue[]\nvia EF Core navigation properties
         EP->>DB: INSERT SurveyResponses + ResponseValues
-        DB-->>EP: Ids assigned by EF Core
     end
 
-    Note over EP,NLP: Phase 6 — Sentiment analysis (batches of 100)
-    EP->>DB: SELECT ResponseValues WHERE ColumnId IN text columns
-    DB-->>EP: textValues[]
+    Note over EP,Q: Phase 6 — Enqueue and return immediately
+    EP->>Q: queue.Enqueue(survey.Id)
+    EP-->>Client: 202 Accepted\n{ id, name, status="queued", totalRows, columnCount }
+
+    Note over W,SPS: Background — Worker picks up survey ID
+    W->>Q: ReadAllAsync() — dequeues survey.Id
+    W->>W: scopeFactory.CreateScope()
+    W->>SPS: ProcessAsync(surveyId, ct)
+
+    SPS->>DB: UPDATE Survey status="processing"
+
+    Note over SPS,NLP: Background Phase A — Sentiment analysis
+    SPS->>DB: SELECT ResponseValues WHERE ColumnId IN text columns
+    DB-->>SPS: textValues[]
 
     loop Every 100 text ResponseValues
-        EP->>SC: AnalyzeAsync(rv.RawValue)
+        SPS->>SC: AnalyzeAsync(rv.RawValue)
         SC->>NLP: POST /analyze { "text": "..." }
-        NLP->>NLP: pipeline(text) → scores[]
         NLP-->>SC: { label, positive, neutral, negative }
-        SC-->>EP: SentimentResponse (or null on failure)
-        EP->>EP: Build SentimentResult entity
-        EP->>DB: INSERT SentimentResults batch
+        SC-->>SPS: SentimentResponse (or null on failure)
+        SPS->>DB: INSERT SentimentResults batch
     end
 
-    Note over EP,DB: Phase 7 — Compute KPI aggregates
+    Note over SPS,DB: Background Phase B — KPI aggregates
     loop Per text column
-        EP->>DB: SELECT SentimentResults WHERE\nResponseValue.ColumnId = columnId
-        DB-->>EP: columnResults[]
-        EP->>EP: AVG(PositiveScore), COUNT(Label=positive), etc.
-        EP->>DB: INSERT KpiAggregate
+        SPS->>DB: SELECT SentimentResults WHERE ColumnId = x
+        SPS->>DB: INSERT KpiAggregate (avg + counts)
     end
 
-    Note over EP,DB: Phase 8 — Mark complete
-    EP->>DB: UPDATE Survey SET status=complete,\nprocessedRows=N, completedAt=now
-    EP-->>Client: 201 Created\n{ id, name, status, totalRows,\n  sentimentAnalyzed, columns[] }
+    SPS->>DB: UPDATE Survey status="complete", processedRows, completedAt
 ```
+
+**Polling:** Angular calls `GET /api/surveys/{id}` every 2s while
+`status` is `queued` or `processing`. The status badge and processing
+banner update live. Polling stops when status reaches `complete` or `error`.
 
 ---
 

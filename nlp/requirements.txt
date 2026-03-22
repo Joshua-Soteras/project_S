@@ -1,0 +1,11 @@
+# This project uses uv for dependency management.
+# Dependencies are defined in pyproject.toml and locked in uv.lock.
+#
+# To install:
+#   uv sync
+#
+# To add a new dependency:
+#   uv add <package>
+#
+# This file is kept only for tools that expect requirements.txt.
+# It is NOT used by the Dockerfile or any install scripts.

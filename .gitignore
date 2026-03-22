@@ -52,6 +52,18 @@ packages/
 *.rsuser
 launchSettings.json.user
 
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Hugging Face model cache (large — do not commit)
+nlp/.cache/
+
 # Build results
 [Dd]ebug/
 [Rr]elease/

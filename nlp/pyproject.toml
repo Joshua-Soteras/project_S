@@ -1,0 +1,26 @@
+[project]
+name = "project-s-nlp"
+version = "0.1.0"
+requires-python = ">=3.11"
+description = "Sentiment analysis microservice using RoBERTa (cardiffnlp/twitter-roberta-base-sentiment-latest)"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "transformers>=4.47.0",
+    "torch>=2.5.0",
+    "scipy>=1.14.0",
+    "numpy>=1.26.0",
+]
+
+# ----------------------------------------
+# uv source override for torch
+# ----------------------------------------
+# torch needs to come from PyTorch's own wheel index to get the
+# CPU-only build (~700MB). Without this, pip/uv would pull the
+# full CUDA build from PyPI (~3.5GB), which we don't need.
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
